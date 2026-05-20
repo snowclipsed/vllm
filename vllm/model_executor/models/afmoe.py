@@ -4,6 +4,7 @@
 
 import typing
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from itertools import islice
 
 import torch
@@ -11,6 +12,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config.kernel import MoEBackend
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -56,10 +58,61 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
 logger = init_logger(__name__)
+
+_TRINITY_LARGE_THINKING_MODEL_ID = "arcee-ai/trinity-large-thinking"
+
+
+def _get_afmoe_moe_backend_override(vllm_config: VllmConfig) -> MoEBackend | None:
+    if vllm_config.kernel_config.moe_backend != "auto":
+        return None
+
+    model_config = vllm_config.model_config
+    if model_config is None or model_config.dtype != torch.bfloat16:
+        return None
+
+    model_ids = [
+        getattr(model_config, "model", None),
+        getattr(model_config, "model_weights", None),
+        getattr(model_config, "hf_config_path", None),
+        getattr(getattr(model_config, "hf_config", None), "_name_or_path", None),
+    ]
+    is_trinity_large_thinking = any(
+        isinstance(model_id, str)
+        and model_id.rstrip("/").casefold() == _TRINITY_LARGE_THINKING_MODEL_ID
+        for model_id in model_ids
+    )
+    if not is_trinity_large_thinking:
+        return None
+
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(100)
+    ):
+        return None
+
+    # Trinity-Large-Thinking BF16 regresses with the FlashInfer TRTLLM MoE
+    # backend on Blackwell. Keep explicit user backend choices respected.
+    return "triton"
+
+
+@contextmanager
+def _maybe_override_afmoe_moe_backend(vllm_config: VllmConfig):
+    moe_backend = _get_afmoe_moe_backend_override(vllm_config)
+    if moe_backend is None:
+        yield
+        return
+
+    original_moe_backend = vllm_config.kernel_config.moe_backend
+    vllm_config.kernel_config.moe_backend = moe_backend
+    try:
+        yield
+    finally:
+        vllm_config.kernel_config.moe_backend = original_moe_backend
 
 
 class AfmoeMoE(nn.Module):
@@ -128,25 +181,26 @@ class AfmoeMoE(nn.Module):
             )
 
         # Routed experts using FusedMoE
-        self.experts = FusedMoE(
-            shared_experts=self.shared_experts,
-            num_experts=config.num_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            renormalize=self.route_norm if self.score_func == "sigmoid" else False,
-            quant_config=quant_config,
-            use_grouped_topk=True,
-            num_expert_group=config.n_group,
-            topk_group=config.topk_group,
-            prefix=f"{prefix}.experts",
-            scoring_func=self.score_func,
-            routed_scaling_factor=self.route_scale,
-            e_score_correction_bias=self.expert_bias,
-            enable_eplb=self.enable_eplb,
-            num_redundant_experts=self.n_redundant_experts,
-            router_logits_dtype=torch.float32,
-        )
+        with _maybe_override_afmoe_moe_backend(vllm_config):
+            self.experts = FusedMoE(
+                shared_experts=self.shared_experts,
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                renormalize=self.route_norm if self.score_func == "sigmoid" else False,
+                quant_config=quant_config,
+                use_grouped_topk=True,
+                num_expert_group=config.n_group,
+                topk_group=config.topk_group,
+                prefix=f"{prefix}.experts",
+                scoring_func=self.score_func,
+                routed_scaling_factor=self.route_scale,
+                e_score_correction_bias=self.expert_bias,
+                enable_eplb=self.enable_eplb,
+                num_redundant_experts=self.n_redundant_experts,
+                router_logits_dtype=torch.float32,
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
